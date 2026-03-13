@@ -1,21 +1,16 @@
 import os
 import asyncio
 import logging
-import hmac
-import hashlib
-import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from aiogram.webhook.aiohttp_server import SimpleWebhookApplication, setup_application
 from dotenv import load_dotenv
 import aiohttp
 import aiosqlite
-from aiohttp import web
 
 # ==================== ЗАГРУЗКА ПЕРЕМЕННЫХ ====================
 load_dotenv()
@@ -27,10 +22,6 @@ PRICE = float(os.getenv('PRICE_AMOUNT'))
 REWARD = float(os.getenv('REFERRAL_REWARD'))
 CURRENCY = os.getenv('CURRENCY')
 MIN_WITHDRAWAL = float(os.getenv('MIN_WITHDRAWAL'))
-WEBHOOK_URL = os.getenv('WEBHOOK_URL')
-WEBHOOK_PATH = os.getenv('WEBHOOK_PATH')
-HOST = os.getenv('HOST', '0.0.0.0')
-PORT = int(os.getenv('PORT', 8080))
 
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
@@ -185,12 +176,20 @@ async def create_invoice(user_id):
         async with session.post(url, headers=headers, json=data) as response:
             return await response.json(), order_id
 
+async def check_invoice_status(invoice_id):
+    """Проверка статуса счета в CryptoBot"""
+    url = "https://pay.crypt.bot/api/getInvoiceInfo"
+    headers = {"X-Crypto-Api-Key": CRYPTOBOT_API_KEY}
+    data = {"invoice_id": invoice_id}
+    async with aiohttp.ClientSession() as session:
+        async with session.post(url, headers=headers, json=data) as response:
+            return await response.json()
+
 async def create_payout(username, amount):
     """Выплата через CryptoBot (ТОЛЬКО @username)"""
     url = "https://pay.crypt.bot/api/transfer"
     headers = {"X-Crypto-Api-Key": CRYPTOBOT_API_KEY}
     
-    # Убираем @ для API
     clean_username = username.replace('@', '')
     
     data = {
@@ -205,89 +204,87 @@ async def create_payout(username, amount):
         async with session.post(url, headers=headers, json=data) as response:
             return await response.json()
 
-# ==================== ВЕРИФИКАЦИЯ WEBHOOK ====================
-def verify_cryptobot_signature(body, signature):
-    """Проверка подписи от CryptoBot"""
-    expected_signature = hmac.new(
-        CRYPTOBOT_API_KEY.encode('utf-8'), 
-        body, 
-        hashlib.sha256
-    ).hexdigest()
-    return hmac.compare_digest(expected_signature.lower(), signature.lower())
-
-# ==================== ОБРАБОТЧИК WEBHOOK ====================
-async def webhook_handler(request):
-    body = await request.read()
-    signature = request.headers.get('Crypto-Pay-API-Signature', '')
+# ==================== ФОНОВАЯ ПРОВЕРКА ПЛАТЕЖЕЙ (POLLING) ====================
+async def check_pending_payments_periodically():
+    """Фоновая проверка неоплаченных счетов каждые 30 секунд"""
+    logging.info("🔄 Запущена фоновая проверка платежей...")
     
-    if signature and not verify_cryptobot_signature(body, signature):
-        logging.warning("⚠️ Неверная подпись Webhook!")
-        return web.Response(status=403)
-
-    try:
-        data = json.loads(body)
-        update_type = data.get('update_type')
-        
-        if update_type == 'invoice_paid':
-            invoice = data.get('payload', {})
-            invoice_id = invoice.get('invoice_id')
-            user_id = int(invoice.get('payload', 0))
-            amount = float(invoice.get('amount', 0))
+    while True:
+        try:
+            await asyncio.sleep(30)  # Ждём 30 секунд
             
-            payment = await get_payment(invoice_id)
-            if payment and payment[3] == 'paid':
-                return web.Response(status=200)
-            
-            await update_payment_status(invoice_id, 'paid')
-            await mark_paid(user_id)
-            
-            product_link = await get_product_link()
-            
-            try:
-                await bot.send_message(user_id, 
-                    f"✅ **ОПЛАТА ПОДТВЕРЖДЕНА!**\n\n"
-                    f"💰 Сумма: {amount} {CURRENCY}\n"
-                    f"📦 Продукт активирован!\n\n"
-                    f"Нажмите кнопку **📚 Продукт** в меню, чтобы получить доступ.",
-                    parse_mode="Markdown"
+            async with aiosqlite.connect('users.db') as db:
+                # Берем все неоплаченные счета за последние 24 часа
+                cursor = await db.execute(
+                    "SELECT invoice_id, user_id, amount FROM payments WHERE status = 'pending'"
                 )
-            except Exception as e:
-                logging.error(f"Не удалось отправить уведомление: {e}")
+                pending = await cursor.fetchall()
             
-            await bot.send_message(ADMIN_ID,
-                f"💎 **НОВАЯ ОПЛАТА!**\n\n"
-                f"👤 User ID: `{user_id}`\n"
-                f"💰 Сумма: {amount} {CURRENCY}\n"
-                f"🔗 Invoice: `{invoice_id}`",
-                parse_mode="Markdown"
-            )
-            
-            referrer_id = await get_referrer(user_id)
-            if referrer_id:
-                ref_user = await get_user(referrer_id)
-                if ref_user and ref_user[2]:
-                    await update_balance(referrer_id, REWARD)
-                    new_balance = (ref_user[4] if ref_user[4] else 0.0) + REWARD
+            for invoice_id, user_id, amount in pending:
+                # Проверяем статус в CryptoBot
+                status_data = await check_invoice_status(invoice_id)
+                
+                if status_data.get('ok'):
+                    result = status_data.get('result', {})
+                    bot_status = result.get('status', '')
                     
-                    try:
-                        await bot.send_message(referrer_id,
-                            f"🎉 **ПО РЕФЕРАЛЬНОЙ ССЫЛКЕ КУПИЛИ!**\n\n"
-                            f"💰 Вам начислено: +${REWARD} USDT\n"
-                            f"📊 Текущий баланс: ${new_balance:.2f} USDT\n\n"
-                            f"Приглашайте ещё больше людей!",
-                            parse_mode="Markdown"
-                        )
-                    except:
-                        pass
-        
-        elif update_type == 'transfer_completed':
-            transfer = data.get('payload', {})
-            logging.info(f"Выплата завершена: {transfer}")
-            
-    except Exception as e:
-        logging.error(f"❌ Ошибка обработки webhook: {e}")
-    
-    return web.Response(status=200)
+                    # Если оплата подтверждена
+                    if bot_status == 'paid':
+                        payment = await get_payment(invoice_id)
+                        if payment and payment[3] != 'paid':  # Если ещё не обработано
+                            await update_payment_status(invoice_id, 'paid')
+                            await mark_paid(user_id)
+                            
+                            product_link = await get_product_link()
+                            
+                            try:
+                                await bot.send_message(user_id, 
+                                    f"✅ **ОПЛАТА ПОДТВЕРЖДЕНА!**\n\n"
+                                    f"💰 Сумма: {amount} {CURRENCY}\n"
+                                    f"📦 Продукт активирован!\n\n"
+                                    f"Нажмите кнопку **📚 Продукт** в меню, чтобы получить доступ.",
+                                    parse_mode="Markdown"
+                                )
+                            except Exception as e:
+                                logging.error(f"Не удалось отправить уведомление: {e}")
+                            
+                            await bot.send_message(ADMIN_ID,
+                                f"💎 **НОВАЯ ОПЛАТА!**\n\n"
+                                f"👤 User ID: `{user_id}`\n"
+                                f"💰 Сумма: {amount} {CURRENCY}\n"
+                                f"🔗 Invoice: `{invoice_id}`",
+                                parse_mode="Markdown"
+                            )
+                            
+                            # Начисление рефереру
+                            referrer_id = await get_referrer(user_id)
+                            if referrer_id:
+                                ref_user = await get_user(referrer_id)
+                                if ref_user and ref_user[2]:
+                                    await update_balance(referrer_id, REWARD)
+                                    new_balance = (ref_user[4] if ref_user[4] else 0.0) + REWARD
+                                    
+                                    try:
+                                        await bot.send_message(referrer_id,
+                                            f"🎉 **ПО РЕФЕРАЛЬНОЙ ССЫЛКЕ КУПИЛИ!**\n\n"
+                                            f"💰 Вам начислено: +${REWARD} USDT\n"
+                                            f"📊 Текущий баланс: ${new_balance:.2f} USDT\n\n"
+                                            f"Приглашайте ещё больше людей!",
+                                            parse_mode="Markdown"
+                                        )
+                                    except:
+                                        pass
+                            
+                            logging.info(f"✅ Оплата {invoice_id} подтверждена через polling")
+                    
+                    # Если оплата истекла или отменена
+                    elif bot_status in ['expired', 'failed']:
+                        await update_payment_status(invoice_id, bot_status)
+                        logging.info(f"❌ Платеж {invoice_id} отменён: {bot_status}")
+                        
+        except Exception as e:
+            logging.error(f"Ошибка проверки платежей: {e}")
+            await asyncio.sleep(60)  # При ошибке ждём минуту
 
 # ==================== КЛАВИАТУРЫ ====================
 def get_main_menu(is_paid, balance=0.0):
@@ -728,7 +725,7 @@ async def support_handler(callback: types.CallbackQuery):
     await callback.message.answer(
         f"📞 **Поддержка**\n\n"
         f"По всем вопросам обращайтесь:\n"
-        f"@daudalb\n\n"
+        f"@YOUR_SUPPORT_USERNAME\n\n"
         f"⏰ Время работы: 24/7\n\n"
         f"📖 Перед обращением прочитайте /help",
         parse_mode="Markdown"
@@ -837,30 +834,24 @@ async def admin_stats(message: types.Message):
         parse_mode="Markdown"
     )
 
-# ==================== ЗАПУСК ====================
+# ==================== ЗАПУСК С LONG POLLING ====================
 
-async def on_startup(bot: Bot):
-    await bot.set_webhook(WEBHOOK_URL)
-    logging.info(f"✅ Webhook установлен на {WEBHOOK_URL}")
+async def on_startup_polling(bot: Bot):
+    """Действия при запуске бота (для polling)"""
+    await bot.delete_webhook()
+    logging.info("✅ Бот запущен в режиме Long Polling")
 
 async def main():
     await init_db()
+    await bot.delete_webhook()
+    dp.startup.register(on_startup_polling)
     
-    app = web.Application()
-    app.router.add_post(WEBHOOK_PATH, webhook_handler)
+    # Запускаем фоновую задачу проверки платежей
+    asyncio.create_task(check_pending_payments_periodically())
     
-    await bot.delete_webhook(drop_pending_updates=True)
-    await on_startup(bot)
-    
-    await setup_application(dp, app, bot=bot)
-    
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, HOST, PORT)
-    await site.start()
-    
-    logging.info(f"🚀 Бот запущен на порту {PORT}")
-    await asyncio.Event().wait()
+    # Запуск бота в режиме POLLING
+    logging.info("🚀 Запуск бота...")
+    await dp.start_polling(bot)
 
 if __name__ == '__main__':
     try:
